@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm ci --include=dev"]
+
+[phases.build]
+cmds = ["echo 'skip tsc build on railway collector deploy'"]
+
+[start]
+cmd = "npm run collect:api"
+
