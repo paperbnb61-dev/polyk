@@ -146,7 +146,7 @@ async function main(): Promise<void> {
   const dbEnabled = await ensureDbReady().catch(() => false);
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
-  await context.route("**/*", (route) => {
+  await context.route("**/*", (route: any) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "media" || t === "font") return route.abort();
     return route.continue();
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
           const btnTexts = await page
             .locator("button, [role='button']")
             .allTextContents()
-            .then((arr) => arr.map((s) => s.trim()).filter(Boolean))
+            .then((arr: string[]) => arr.map((s: string) => s.trim()).filter(Boolean))
             .catch(() => []);
 
           let upRaw: string | null = null;
