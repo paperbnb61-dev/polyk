@@ -70,6 +70,9 @@ function envPriceSource(): "last_trade" | "gamma" | "clob_market" {
 }
 
 const intervalMs = Math.max(500, envNumber("COLLECT_INTERVAL_MS", 5000));
+const tickTimeoutMs = Math.max(1000, envNumber("COLLECT_TICK_TIMEOUT_MS", Math.max(1000, intervalMs - 500)));
+const requestTimeoutMs = Math.max(1000, envNumber("COLLECT_REQUEST_TIMEOUT_MS", 3500));
+const requestRetries = Math.max(0, envNumber("COLLECT_REQUEST_RETRIES", 0));
 const outFile = envString("COLLECT_OUT_FILE", "data/market-snapshots.jsonl");
 const markets = envMarkets();
 const tzMode = envTzMode();
@@ -285,7 +288,7 @@ async function fetchSpotPrice(market: string): Promise<number | null> {
   if (!symbol) return null;
   const url = `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${encodeURIComponent(symbol)}`;
   try {
-    const res = await fetchWithRetry(url, { timeoutMs: 10_000, retries: 1 });
+    const res = await fetchWithRetry(url, { timeoutMs: requestTimeoutMs, retries: requestRetries });
     if (!res.ok) return null;
     const j = (await res.json()) as { bidPrice?: string; askPrice?: string; price?: string };
     const bid = Number(j.bidPrice);
@@ -304,7 +307,7 @@ async function fetchBeatAtWindowStart(market: string, slug: string): Promise<num
   if (!symbol || startMs === null) return null;
   const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1m&startTime=${startMs}&limit=1`;
   try {
-    const rows = await fetchJson<unknown[]>(url, { timeoutMs: 10_000, retries: 1 });
+    const rows = await fetchJson<unknown[]>(url, { timeoutMs: requestTimeoutMs, retries: requestRetries });
     if (!Array.isArray(rows) || rows.length === 0) return null;
     const row = rows[0];
     if (!Array.isArray(row) || row.length < 2) return null;
@@ -322,7 +325,7 @@ async function currentPriceForMarket(market: string): Promise<number | null> {
 
 async function fetchClobBuyPrice(tokenId: string): Promise<number | null> {
   const url = `${clobApiUrl}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
-  const j = await fetchJson<RawClobPrice>(url, { timeoutMs: 20_000, retries: 2 });
+  const j = await fetchJson<RawClobPrice>(url, { timeoutMs: requestTimeoutMs, retries: requestRetries });
   const px = toNum(j.price);
   return px !== null && px >= 0 && px <= 1 ? px : null;
 }
@@ -345,7 +348,7 @@ async function clobMarketCents(
 
 async function latestTradeCents(conditionId: string): Promise<{ upCents: number; downCents: number } | null> {
   const url = `https://data-api.polymarket.com/trades?market=${encodeURIComponent(conditionId)}&limit=200&offset=0`;
-  const rows = await fetchJson<TradeRow[]>(url, { timeoutMs: 20_000, retries: 2 });
+  const rows = await fetchJson<TradeRow[]>(url, { timeoutMs: requestTimeoutMs, retries: requestRetries });
   let upTs = -1;
   let downTs = -1;
   let upPx: number | null = null;
@@ -369,84 +372,100 @@ async function latestTradeCents(conditionId: string): Promise<{ upCents: number;
   return { upCents: Math.round(upPx * 100), downCents: Math.round(downPx * 100) };
 }
 
-async function tick(): Promise<void> {
-  for (const market of markets) {
-    const slug = slugOverride || slugForCurrent15m(market);
-    try {
-      const m = await fetchGammaMarket(slug);
-      const row = toSnapshot(market, m);
-      if (priceSource === "clob_market") {
-        try {
-          const c = await clobMarketCents(m.upTokenId, m.downTokenId);
-          if (c) {
-            row.upCentsBuy = c.upCents;
-            row.downCentsBuy = c.downCents;
-            row.upPriceBuy = c.upCents / 100;
-            row.downPriceBuy = c.downCents / 100;
-            row.quoteSource = "clob_market";
-          }
-        } catch {
-          /* keep gamma snapshot on clob issues */
+async function processMarket(market: string): Promise<void> {
+  const slug = slugOverride || slugForCurrent15m(market);
+  try {
+    const m = await fetchGammaMarket(slug);
+    const row = toSnapshot(market, m);
+    if (priceSource === "clob_market") {
+      try {
+        const c = await clobMarketCents(m.upTokenId, m.downTokenId);
+        if (c) {
+          row.upCentsBuy = c.upCents;
+          row.downCentsBuy = c.downCents;
+          row.upPriceBuy = c.upCents / 100;
+          row.downPriceBuy = c.downCents / 100;
+          row.quoteSource = "clob_market";
         }
-      } else if (priceSource === "last_trade") {
-        try {
-          const t = await latestTradeCents(m.conditionId);
-          if (t) {
-            row.upCentsBuy = t.upCents;
-            row.downCentsBuy = t.downCents;
-            row.upPriceBuy = t.upCents / 100;
-            row.downPriceBuy = t.downCents / 100;
-            row.quoteSource = "last_trade";
-          }
-        } catch {
-          /* keep gamma snapshot on trade API issues */
+      } catch {
+        /* keep gamma snapshot on clob issues */
+      }
+    } else if (priceSource === "last_trade") {
+      try {
+        const t = await latestTradeCents(m.conditionId);
+        if (t) {
+          row.upCentsBuy = t.upCents;
+          row.downCentsBuy = t.downCents;
+          row.upPriceBuy = t.upCents / 100;
+          row.downPriceBuy = t.downCents / 100;
+          row.quoteSource = "last_trade";
         }
+      } catch {
+        /* keep gamma snapshot on trade API issues */
       }
-      if (includeSpotContext) {
-        try {
-          const spot = await currentPriceForMarket(market);
-          if (spot !== null) {
-            row.currentPrice = spot;
-            if (!beatBySlug.has(slug)) {
-              beatBySlug.set(slug, spot);
-            }
-            const beat = beatBySlug.get(slug) ?? spot;
-            row.priceToBeat = beat;
-            row.deltaFromPriceToBeat = spot - beat;
-            row.deltaFromPriceToBeatPct = beat !== 0 ? ((spot - beat) / beat) * 100 : null;
-          }
-        } catch {
-          /* keep null when spot API temporarily fails */
-        }
-      }
-      const file = outPathFor(row.tsMs);
-      const fp = `${row.slug}|${row.upCentsBuy}|${row.downCentsBuy}|${row.currentPrice?.toFixed(2) ?? "na"}|${row.priceToBeat?.toFixed(2) ?? "na"}`;
-      const prev = lastFingerprintByMarket.get(market);
-      if (!onlyOnChange || prev !== fp) {
-        appendLine(file, JSON.stringify(row));
-        await insertCollectorRow({
-          collector: "api",
-          tsUtc: row.tsIsoUtc,
-          tsMs: row.tsMs,
-          tsLocal: row.tsLocal,
-          market: row.market,
-          slug: row.slug,
-          upCentsBuy: row.upCentsBuy,
-          downCentsBuy: row.downCentsBuy,
-          payload: row,
-        }).catch(() => {});
-        const spotMsg = includeSpotContext
-          ? ` current=${row.currentPrice ?? "na"} beat=${row.priceToBeat ?? "na"}`
-          : "";
-        console.log(
-          `[collect] ${row.tsLocal} ${market} ${row.slug} buy up=${row.upCentsBuy}c down=${row.downCentsBuy}c (${row.quoteSource})${spotMsg} -> ${file}`
-        );
-        lastFingerprintByMarket.set(market, fp);
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.warn(`[collect] ${formatLocal(Date.now())} ${market} ${slug} error: ${msg}`);
     }
+    if (includeSpotContext) {
+      try {
+        const spot = await currentPriceForMarket(market);
+        if (spot !== null) {
+          row.currentPrice = spot;
+          if (!beatBySlug.has(slug)) {
+            beatBySlug.set(slug, spot);
+          }
+          const beat = beatBySlug.get(slug) ?? spot;
+          row.priceToBeat = beat;
+          row.deltaFromPriceToBeat = spot - beat;
+          row.deltaFromPriceToBeatPct = beat !== 0 ? ((spot - beat) / beat) * 100 : null;
+        }
+      } catch {
+        /* keep null when spot API temporarily fails */
+      }
+    }
+    const file = outPathFor(row.tsMs);
+    const fp = `${row.slug}|${row.upCentsBuy}|${row.downCentsBuy}|${row.currentPrice?.toFixed(2) ?? "na"}|${row.priceToBeat?.toFixed(2) ?? "na"}`;
+    const prev = lastFingerprintByMarket.get(market);
+    if (!onlyOnChange || prev !== fp) {
+      appendLine(file, JSON.stringify(row));
+      void insertCollectorRow({
+        collector: "api",
+        tsUtc: row.tsIsoUtc,
+        tsMs: row.tsMs,
+        tsLocal: row.tsLocal,
+        market: row.market,
+        slug: row.slug,
+        upCentsBuy: row.upCentsBuy,
+        downCentsBuy: row.downCentsBuy,
+        payload: row,
+      }).catch(() => {});
+      const spotMsg = includeSpotContext
+        ? ` current=${row.currentPrice ?? "na"} beat=${row.priceToBeat ?? "na"}`
+        : "";
+      console.log(
+        `[collect] ${row.tsLocal} ${market} ${row.slug} buy up=${row.upCentsBuy}c down=${row.downCentsBuy}c (${row.quoteSource})${spotMsg} -> ${file}`
+      );
+      lastFingerprintByMarket.set(market, fp);
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[collect] ${formatLocal(Date.now())} ${market} ${slug} error: ${msg}`);
+  }
+}
+
+async function tick(): Promise<void> {
+  await Promise.allSettled(markets.map((market) => processMarket(market)));
+}
+
+async function tickWithTimeout(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      tick(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`tick timeout after ${tickTimeoutMs}ms`)), tickTimeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -456,11 +475,29 @@ async function main(): Promise<void> {
   const dbEnabled = await ensureDbReady().catch(() => false);
   const example = outPathFor(Date.now());
   console.log(
-    `Collector started. interval=${intervalMs}ms markets=${markets.join(",")} tz=${tzMode} source=${priceSource} slug=${slugOverride || "auto-current"} onlyOnChange=${onlyOnChange} spotContext=${includeSpotContext} db=${dbEnabled ? "on" : "off"} filePattern=${example}`
+    `Collector started. interval=${intervalMs}ms tickTimeout=${tickTimeoutMs}ms requestTimeout=${requestTimeoutMs}ms requestRetries=${requestRetries} markets=${markets.join(",")} tz=${tzMode} source=${priceSource} slug=${slugOverride || "auto-current"} onlyOnChange=${onlyOnChange} spotContext=${includeSpotContext} db=${dbEnabled ? "on" : "off"} filePattern=${example}`
   );
+  let nextRunAt = Date.now();
   for (;;) {
-    await tick();
-    await new Promise((r) => setTimeout(r, intervalMs));
+    const startedAt = Date.now();
+    try {
+      await tickWithTimeout();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[collect] ${formatLocal(Date.now())} loop warning: ${msg}`);
+    }
+    nextRunAt += intervalMs;
+    const now = Date.now();
+    if (nextRunAt < now - intervalMs) {
+      // If we lagged too much, resync schedule to "now" and continue fixed-rate from here.
+      nextRunAt = now;
+    }
+    const sleepMs = Math.max(0, nextRunAt - now);
+    if (sleepMs > 0) {
+      await new Promise((r) => setTimeout(r, sleepMs));
+    } else if (Date.now() - startedAt > intervalMs) {
+      console.warn(`[collect] ${formatLocal(Date.now())} loop warning: cycle exceeded interval (${Date.now() - startedAt}ms > ${intervalMs}ms)`);
+    }
   }
 }
 
