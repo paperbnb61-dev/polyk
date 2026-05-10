@@ -4,6 +4,7 @@ import path from "path";
 import { fetchGammaMarket } from "./gamma.js";
 import { fetchJson } from "./http.js";
 import { slugForCurrent15m } from "./slug.js";
+import { ensureDbReady, insertPaperEvent } from "./db.js";
 
 dotenv.config();
 
@@ -46,10 +47,10 @@ function mean(nums: number[]): number {
 const market = envString("PAPER_MARKET", "btc").toLowerCase();
 const pollMs = Math.max(500, envNumber("PAPER_POLL_INTERVAL_MS", 2500));
 const maxPairSumCents = clampCents(envNumber("PAPER_MAX_PAIR_SUM_CENTS", 98));
-const firstLegMaxCents = clampCents(envNumber("PAPER_FIRST_LEG_MAX_CENTS", 55));
-const secondLegTimeoutSec = Math.max(1, envNumber("PAPER_SECOND_LEG_TIMEOUT_SEC", 12));
-const maxLegsPerSide = Math.max(1, envNumber("PAPER_MAX_LEGS_PER_SIDE", 4));
-const addStepCents = Math.max(1, envNumber("PAPER_ADD_STEP_CENTS", 2));
+const firstLegMaxCents = clampCents(envNumber("PAPER_FIRST_LEG_MAX_CENTS", 52));
+const secondLegTimeoutSec = Math.max(1, envNumber("PAPER_SECOND_LEG_TIMEOUT_SEC", 14));
+const maxLegsPerSide = Math.max(1, envNumber("PAPER_MAX_LEGS_PER_SIDE", 3));
+const addStepCents = Math.max(1, envNumber("PAPER_ADD_STEP_CENTS", 3));
 const forceSecondLeg = envString("PAPER_FORCE_SECOND_LEG", "true").toLowerCase() === "true";
 const sharesPerLeg = Math.max(0.01, envNumber("PAPER_SHARES_PER_LEG", 10));
 const feeRate = Math.max(0, envNumber("PAPER_FEE_RATE", 0.00072));
@@ -64,19 +65,61 @@ let realizedUsd = 0;
 let position: Position | null = null;
 let totalTrades = 0;
 let totalBuys = 0;
+let dbEnabled = false;
+
+function detectEventType(message: string): string {
+  if (message.startsWith("BUY ")) return "BUY";
+  if (message.startsWith("CLOSE ")) return "CLOSE";
+  if (message.includes("Paper bot started")) return "START";
+  if (message.includes("tick error")) return "ERROR";
+  return "STATUS";
+}
+
+function extractSlug(message: string): string | null {
+  const m = message.match(/(btc-updown-15m-\d+)/);
+  return m?.[1] ?? null;
+}
 
 function appendPaperLog(level: "info" | "warn" | "error", message: string): void {
+  const tsIsoUtc = new Date().toISOString();
+  const tsMs = Date.now();
+  const slug = extractSlug(message);
+  const eventType = detectEventType(message);
   try {
     const outPath = path.resolve(process.cwd(), paperLogFile);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     const row = {
-      tsIsoUtc: new Date().toISOString(),
+      tsIsoUtc,
+      tsMs,
       level,
+      market,
+      slug,
+      eventType,
       message,
     };
     fs.appendFileSync(outPath, JSON.stringify(row) + "\n", "utf8");
   } catch {
     /* ignore file logging errors */
+  }
+  if (dbEnabled) {
+    void insertPaperEvent({
+      tsUtc: tsIsoUtc,
+      tsMs,
+      level,
+      market,
+      slug,
+      eventType,
+      message,
+      payload: {
+        market,
+        slug,
+        eventType,
+        cashUsd,
+        realizedUsd,
+        totalBuys,
+        totalTrades,
+      },
+    }).catch(() => {});
   }
 }
 
@@ -260,10 +303,20 @@ async function tick(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const dbUrlPresent = Boolean(process.env.DATABASE_URL?.trim());
+  if (!dbUrlPresent) {
+    logInfo("db=off reason=no DATABASE_URL (add Variable Reference Postgres → DATABASE_URL on this service)");
+  } else {
+    dbEnabled = await ensureDbReady().catch((e) => {
+      const m = e instanceof Error ? e.message : String(e);
+      logWarn(`db=off reason=ensureDbReady failed: ${m}`);
+      return false;
+    });
+  }
   logInfo(
     `Paper bot started. market=${market} poll=${pollMs}ms sum<=${maxPairSumCents} first<=${firstLegMaxCents} timeout=${secondLegTimeoutSec}s legs<=${maxLegsPerSide} step=${addStepCents}c shares=${sharesPerLeg} start=$${initialUsd.toFixed(
       2
-    )} telegram=${telegramToken && telegramChatId ? "on" : "off"} logFile=${paperLogFile}`
+    )} telegram=${telegramToken && telegramChatId ? "on" : "off"} db=${dbEnabled ? "on" : "off"} logFile=${paperLogFile}`
   );
   await notifyTelegram(
     `Paper bot started: ${market.toUpperCase()} | sum<=${maxPairSumCents} first<=${firstLegMaxCents} timeout=${secondLegTimeoutSec}s legs<=${maxLegsPerSide} step=${addStepCents}c`
