@@ -103,12 +103,15 @@ export class ClobTrader {
     }
 
     try {
-      const response = await client.createAndPostOrder(
+      // FOK must use market order API; BUY amount is USDC notional.
+      const amountUsd = size * limitPx;
+      const response = await client.createAndPostMarketOrder(
         {
           tokenID: tokenId,
           price: limitPx,
-          size,
+          amount: amountUsd,
           side: Side.BUY,
+          orderType: OrderType.FOK,
         },
         { tickSize, negRisk },
         OrderType.FOK
