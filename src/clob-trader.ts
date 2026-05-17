@@ -4,6 +4,7 @@ import {
   OrderType,
   Side,
   SignatureTypeV2,
+  type TickSize,
 } from "@polymarket/clob-client-v2";
 import { createWalletClient, http, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -92,10 +93,10 @@ export class ClobTrader {
     const client = this.client;
     if (!client) return { ok: false, error: "clob client not initialized" };
 
-    let tickSize = "0.01";
+    let tickSize: TickSize = "0.01";
     let negRisk = negRiskFallback;
     try {
-      tickSize = await client.getTickSize(tokenId);
+      tickSize = (await client.getTickSize(tokenId)) as TickSize;
       negRisk = await client.getNegRisk(tokenId);
     } catch {
       /* use defaults */
