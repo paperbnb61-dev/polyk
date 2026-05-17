@@ -11,7 +11,17 @@ import {
   type SlugPosition,
 } from "./cele-strategy.js";
 import { ClobTrader, parsePrivateKey } from "./clob-trader.js";
-import { envNumber, envString } from "./env-util.js";
+import {
+  formatPnlReport,
+  loadDryPnl,
+  markReportSent,
+  recordBuy,
+  recordWindowEnd,
+  saveDryPnl,
+  shouldSendReport,
+  type DryPnlState,
+} from "./dry-pnl.js";
+import { envBool, envNumber, envString } from "./env-util.js";
 import type { ParsedMarket } from "./gamma.js";
 import { fetchMarketQuote, isQuoteTradable } from "./market-quotes.js";
 import { slugForCurrent15m } from "./slug.js";
@@ -23,7 +33,8 @@ const pollMs = Math.max(120, envNumber("LIVE_POLL_INTERVAL_MS", envNumber("PAPER
 const cele = loadCeleConfig("LIVE_");
 const slippageCents = Math.max(0, envNumber("LIVE_SLIPPAGE_CENTS", 2));
 const negRisk = envString("LIVE_NEG_RISK", "false").toLowerCase() === "true";
-const maxBuyUsdPerDay = Math.max(0, envNumber("LIVE_MAX_BUY_USD_PER_DAY", 5000));
+/** 0 = no daily buy cap */
+const maxBuyUsdPerDay = Math.max(0, envNumber("LIVE_MAX_BUY_USD_PER_DAY", 0));
 const tradingMode = envString("LIVE_TRADING_MODE", "dry").toLowerCase();
 const confirmRisk = envString("LIVE_CONFIRM", "").toLowerCase() === "yes";
 
@@ -33,10 +44,17 @@ const rpcUrl = envString("POLYGON_RPC_URL", "");
 const telegramToken = envString("TELEGRAM_BOT_TOKEN", "");
 const telegramChatId = envString("TELEGRAM_CHAT_ID", "");
 const liveLogFile = envString("LIVE_LOG_FILE", "data/live-logs.jsonl");
+const dryPnlSummaryFile = envString("LIVE_DRY_PNL_SUMMARY_FILE", "data/dry-pnl-summary.json");
+const pnlReportIntervalMs = Math.max(
+  60_000,
+  envNumber("LIVE_PNL_REPORT_INTERVAL_MS", envNumber("LIVE_PNL_REPORT_INTERVAL_HOURS", 2) * 3_600_000),
+);
+const pnlReportEnabled = envBool("LIVE_PNL_REPORT_ENABLED", true);
+const telegramOnBuy = envBool("LIVE_TELEGRAM_ON_BUY", false);
+const telegramOnWindowEnd = envBool("LIVE_TELEGRAM_ON_WINDOW_END", false);
 
 let position: SlugPosition | null = null;
-let totalWindows = 0;
-let totalBuys = 0;
+let dryPnl: DryPnlState = loadDryPnl(dryPnlSummaryFile);
 let buyUsdToday = 0;
 let buyUsdDayKey = "";
 let trader: ClobTrader | null = null;
@@ -124,27 +142,59 @@ async function buySide(side: Side, cents: number, slug: string, gm: ParsedMarket
     return false;
   }
 
-  totalBuys += 1;
+  recordBuy(dryPnl);
+  saveDryPnl(dryPnlSummaryFile, dryPnl);
+
   const mode = res.dryRun ? "DRY" : "LIVE";
-  const msg = `${mode} BUY ${market.toUpperCase()} ${sideLabel} ${cele.sharesPerOrder}@${cents}c | ${reason} | #${totalBuys} | ${slug}${
+  const msg = `${mode} BUY ${market.toUpperCase()} ${sideLabel} ${cele.sharesPerOrder}@${cents}c | ${reason} | #${dryPnl.totalBuys} | ${slug}${
     res.orderId ? ` oid=${res.orderId}` : ""
   }`;
   logInfo(msg);
-  await notifyTelegram(msg);
+  if (telegramOnBuy) await notifyTelegram(msg);
   return true;
 }
 
 async function closeWindow(pos: SlugPosition, upMark: number, downMark: number): Promise<void> {
   const s = settleWindow(pos, upMark, downMark);
-  totalWindows += 1;
   const estReturn = s.pairedRedeemUsd + s.unpairedUpUsd + s.unpairedDownUsd;
   const estPnl = estReturn - s.buyUsd;
+
+  recordWindowEnd(dryPnl, { slug: s.slug, buyUsd: s.buyUsd, estReturn, estPnl });
+  saveDryPnl(dryPnlSummaryFile, dryPnl);
+
+  const cumMsg =
+    `CUM est PnL | windows=${dryPnl.windows} wins=${dryPnl.wins} | ` +
+    `total=$${dryPnl.totalEstPnlUsd.toFixed(2)} (buy=$${dryPnl.totalBuyUsd.toFixed(2)})`;
+
   const msg =
     `WINDOW END ${s.slug} | paired=${s.pairedShares.toFixed(1)} sumAvg=${s.sumAvgCents.toFixed(1)}c | ` +
     `buy=$${s.buyUsd.toFixed(2)} estReturn=$${estReturn.toFixed(2)} estPnl=$${estPnl.toFixed(2)} | ` +
-    `up=${s.upQty.toFixed(1)} down=${s.downQty.toFixed(1)} | holds until REDEEM on Polymarket`;
+    `up=${s.upQty.toFixed(1)} down=${s.downQty.toFixed(1)}`;
   logInfo(msg);
-  await notifyTelegram(msg);
+  logInfo(cumMsg);
+  if (telegramOnWindowEnd) await notifyTelegram(`${msg}\n${cumMsg}`);
+}
+
+async function maybeSendPnlReport(nowMs: number): Promise<void> {
+  if (!pnlReportEnabled) return;
+  if (!shouldSendReport(dryPnl, pnlReportIntervalMs, nowMs)) return;
+
+  const modeLabel = isLive ? "LIVE" : "DRY-RUN";
+  const hours = pnlReportIntervalMs / 3_600_000;
+  const openLine = position ? formatPositionLine(position) : "flat";
+  const text = formatPnlReport({
+    modeLabel,
+    market,
+    intervalHours: hours,
+    state: dryPnl,
+    buyUsdToday,
+    openPositionLine: openLine,
+  });
+
+  markReportSent(dryPnl);
+  saveDryPnl(dryPnlSummaryFile, dryPnl);
+  logInfo(`PNL REPORT\n${text}`);
+  await notifyTelegram(text);
 }
 
 async function tick(): Promise<void> {
@@ -187,6 +237,8 @@ async function tick(): Promise<void> {
   logInfo(
     `${q.slug} ask up=${q.upAskCents}c down=${q.downAskCents}c sum=${q.upAskCents + q.downAskCents}c | ${posLine}`,
   );
+
+  await maybeSendPnlReport(now);
 }
 
 async function main(): Promise<void> {
@@ -222,10 +274,15 @@ async function main(): Promise<void> {
     `Cele-style bot ${modeLabel} | ${market.toUpperCase()} | poll=${pollMs}ms | ` +
     `shares=${cele.sharesPerOrder} maxLegs/side=${cele.maxBuysPerSide} maxSumAvg=${cele.maxSumAvg} ` +
     `instantSum<=${cele.maxInstantSumCents}c imbalance<=${cele.maxSideImbalanceShares} ` +
-    `2ndSide=${cele.secondSideTimeThresholdMs}ms cap=$${maxBuyUsdPerDay}/day`;
+    `2ndSide=${cele.secondSideTimeThresholdMs}ms cap=${maxBuyUsdPerDay > 0 ? `$${maxBuyUsdPerDay}/day` : "off"}`;
   logInfo(startMsg);
-  await notifyTelegram(startMsg);
-  if (isLive) await notifyTelegram("LIVE ON — cele accumulation mode. Real USDC at risk.");
+  const reportH = (pnlReportIntervalMs / 3_600_000).toFixed(1);
+  await notifyTelegram(
+    `${startMsg}\nPnL сводка в Telegram каждые ${reportH}ч (LIVE_PNL_REPORT_ENABLED=${pnlReportEnabled}).`,
+  );
+  if (isLive) await notifyTelegram("LIVE ON — real USDC at risk.");
+
+  dryPnl = loadDryPnl(dryPnlSummaryFile);
 
   for (;;) {
     try {
