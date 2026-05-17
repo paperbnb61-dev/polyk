@@ -1,75 +1,41 @@
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import { fetchGammaMarket } from "./gamma.js";
-import { fetchJson } from "./http.js";
+import {
+  applyBuy,
+  decideBuy,
+  formatPositionLine,
+  loadCeleConfig,
+  settleWindow,
+  type Side,
+  type SlugPosition,
+} from "./cele-strategy.js";
+import { envNumber, envString } from "./env-util.js";
+import { fetchMarketQuote, isQuoteTradable } from "./market-quotes.js";
 import { slugForCurrent15m } from "./slug.js";
 import { ensureDbReady, insertPaperEvent } from "./db.js";
 
 dotenv.config();
 
-type Side = "UP" | "DOWN";
-type PriceRow = { upCents: number; downCents: number; slug: string };
-type ClobPrice = { price?: string | number };
-
-type Position = {
-  slug: string;
-  openedAtMs: number;
-  firstSide: Side;
-  firstLegPrices: number[];
-  secondLegPrices: number[];
-  lastFirstFillCents: number;
-  forced: boolean;
-};
-
-function envString(name: string, fallback: string): string {
-  const raw = process.env[name];
-  const v = typeof raw === "string" ? raw.trim() : "";
-  return v || fallback;
-}
-
-function envNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clampCents(n: number): number {
-  return Math.max(0, Math.min(100, Math.round(n)));
-}
-
-function mean(nums: number[]): number {
-  if (!nums.length) return 0;
-  return nums.reduce((a, b) => a + b, 0) / nums.length;
-}
-
 const market = envString("PAPER_MARKET", "btc").toLowerCase();
-const pollMs = Math.max(500, envNumber("PAPER_POLL_INTERVAL_MS", 2500));
-const maxPairSumCents = clampCents(envNumber("PAPER_MAX_PAIR_SUM_CENTS", 98));
-const firstLegMaxCents = clampCents(envNumber("PAPER_FIRST_LEG_MAX_CENTS", 52));
-const secondLegTimeoutSec = Math.max(1, envNumber("PAPER_SECOND_LEG_TIMEOUT_SEC", 14));
-const maxLegsPerSide = Math.max(1, envNumber("PAPER_MAX_LEGS_PER_SIDE", 3));
-const addStepCents = Math.max(1, envNumber("PAPER_ADD_STEP_CENTS", 3));
-const forceSecondLeg = envString("PAPER_FORCE_SECOND_LEG", "true").toLowerCase() === "true";
-const sharesPerLeg = Math.max(0.01, envNumber("PAPER_SHARES_PER_LEG", 10));
+const pollMs = Math.max(120, envNumber("PAPER_POLL_INTERVAL_MS", 400));
+const cele = loadCeleConfig("PAPER_");
 const feeRate = Math.max(0, envNumber("PAPER_FEE_RATE", 0.00072));
-const initialUsd = Math.max(1, envNumber("PAPER_INITIAL_USD", 1000));
-const clobApiUrl = envString("CLOB_API_URL", "https://clob.polymarket.com").replace(/\/$/, "");
+const initialUsd = Math.max(1, envNumber("PAPER_INITIAL_USD", 10000));
 const telegramToken = envString("TELEGRAM_BOT_TOKEN", "");
 const telegramChatId = envString("TELEGRAM_CHAT_ID", "");
 const paperLogFile = envString("PAPER_LOG_FILE", "data/paper-logs.jsonl");
 
 let cashUsd = initialUsd;
 let realizedUsd = 0;
-let position: Position | null = null;
-let totalTrades = 0;
+let position: SlugPosition | null = null;
+let totalWindows = 0;
 let totalBuys = 0;
 let dbEnabled = false;
 
 function detectEventType(message: string): string {
   if (message.startsWith("BUY ")) return "BUY";
-  if (message.startsWith("CLOSE ")) return "CLOSE";
+  if (message.startsWith("WINDOW END")) return "WINDOW";
   if (message.includes("Paper bot started")) return "START";
   if (message.includes("tick error")) return "ERROR";
   return "STATUS";
@@ -88,18 +54,13 @@ function appendPaperLog(level: "info" | "warn" | "error", message: string): void
   try {
     const outPath = path.resolve(process.cwd(), paperLogFile);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    const row = {
-      tsIsoUtc,
-      tsMs,
-      level,
-      market,
-      slug,
-      eventType,
-      message,
-    };
-    fs.appendFileSync(outPath, JSON.stringify(row) + "\n", "utf8");
+    fs.appendFileSync(
+      outPath,
+      JSON.stringify({ tsIsoUtc, tsMs, level, market, slug, eventType, message }) + "\n",
+      "utf8",
+    );
   } catch {
-    /* ignore file logging errors */
+    /* ignore */
   }
   if (dbEnabled) {
     void insertPaperEvent({
@@ -110,15 +71,7 @@ function appendPaperLog(level: "info" | "warn" | "error", message: string): void
       slug,
       eventType,
       message,
-      payload: {
-        market,
-        slug,
-        eventType,
-        cashUsd,
-        realizedUsd,
-        totalBuys,
-        totalTrades,
-      },
+      payload: { cashUsd, realizedUsd, totalBuys, totalWindows },
     }).catch(() => {});
   }
 }
@@ -135,207 +88,112 @@ function logWarn(message: string): void {
 
 async function notifyTelegram(text: string): Promise<void> {
   if (!telegramToken || !telegramChatId) return;
-  const url = `https://api.telegram.org/bot${telegramToken}/sendMessage`;
   try {
-    await fetch(url, {
+    await fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: telegramChatId,
-        text,
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: telegramChatId, text, disable_web_page_preview: true }),
     });
   } catch {
-    /* ignore telegram errors */
+    /* ignore */
   }
 }
 
-async function fetchClobBuyPrice(tokenId?: string): Promise<number | null> {
-  if (!tokenId) return null;
-  const url = `${clobApiUrl}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
-  try {
-    const j = await fetchJson<ClobPrice>(url, { timeoutMs: 3500, retries: 0 });
-    const px = typeof j.price === "string" ? Number(j.price) : typeof j.price === "number" ? j.price : NaN;
-    if (!Number.isFinite(px)) return null;
-    return Math.max(0.001, Math.min(0.999, px));
-  } catch {
-    return null;
-  }
-}
-
-async function getLivePrices(slug: string): Promise<PriceRow> {
-  const gm = await fetchGammaMarket(slug);
-  const [upPx, downPx] = await Promise.all([fetchClobBuyPrice(gm.upTokenId), fetchClobBuyPrice(gm.downTokenId)]);
-  const up = upPx ?? gm.upMid;
-  const down = downPx ?? gm.downMid;
-  return { upCents: clampCents(up * 100), downCents: clampCents(down * 100), slug: gm.slug };
-}
-
-async function buyLeg(side: Side, cents: number, slug: string): Promise<void> {
-  const px = cents / 100;
-  const cost = px * sharesPerLeg;
+async function buySide(side: Side, cents: number, slug: string, reason: string): Promise<void> {
+  const cost = (cents / 100) * cele.sharesPerOrder;
   const fee = cost * feeRate;
   cashUsd -= cost + fee;
   totalBuys += 1;
-  const sideLabel = side === "UP" ? "YES" : "NO";
-  const msg = `BUY ${market.toUpperCase()} ${sideLabel} ${sharesPerLeg} @ ${cents}c | buys=${totalBuys} | cash=$${cashUsd.toFixed(
-    2
-  )} | realized=$${realizedUsd.toFixed(2)} | ${slug}`;
+  const label = side === "UP" ? "YES" : "NO";
+  const msg =
+    `BUY ${market.toUpperCase()} ${label} ${cele.sharesPerOrder}@${cents}c | ${reason} | #${totalBuys} | ` +
+    `cash=$${cashUsd.toFixed(2)} realized=$${realizedUsd.toFixed(2)} | ${slug}`;
   logInfo(msg);
   await notifyTelegram(msg);
 }
 
-async function tryOpenPosition(pr: PriceRow, now: number): Promise<void> {
-  if (position) return;
-  const firstSide: Side = pr.upCents <= pr.downCents ? "UP" : "DOWN";
-  const firstPrice = firstSide === "UP" ? pr.upCents : pr.downCents;
-  const secondPrice = firstSide === "UP" ? pr.downCents : pr.upCents;
-  if (firstPrice > firstLegMaxCents) return;
-  if (firstPrice + secondPrice > maxPairSumCents) return;
-  await buyLeg(firstSide, firstPrice, pr.slug);
-  position = {
-    slug: pr.slug,
-    openedAtMs: now,
-    firstSide,
-    firstLegPrices: [firstPrice],
-    secondLegPrices: [],
-    lastFirstFillCents: firstPrice,
-    forced: false,
-  };
-}
-
-async function settlePosition(pos: Position, now: number): Promise<void> {
-  const pairs = Math.min(pos.firstLegPrices.length, pos.secondLegPrices.length);
-  if (pairs <= 0) return;
-  const payout = pairs * sharesPerLeg;
-  cashUsd += payout;
-  const avgFirst = mean(pos.firstLegPrices);
-  const avgSecond = mean(pos.secondLegPrices);
-  const pairSum = avgFirst + avgSecond;
-  const grossPerPair = (100 - pairSum) / 100 * sharesPerLeg;
-  const feePaid =
-    (pos.firstLegPrices.reduce((a, c) => a + c / 100, 0) + pos.secondLegPrices.reduce((a, c) => a + c / 100, 0)) *
-    sharesPerLeg *
-    feeRate;
-  const pnl = grossPerPair * pairs - feePaid;
+async function closeWindow(pos: SlugPosition, upMark: number, downMark: number): Promise<void> {
+  const s = settleWindow(pos, upMark, downMark);
+  const returnUsd = s.pairedRedeemUsd + s.unpairedUpUsd + s.unpairedDownUsd;
+  const fees = s.buyUsd * feeRate * 2;
+  const pnl = returnUsd - s.buyUsd - fees;
+  cashUsd += returnUsd;
   realizedUsd += pnl;
-  totalTrades += 1;
-  const elapsedSec = ((now - pos.openedAtMs) / 1000).toFixed(1);
-  const closeMsg = `CLOSE ${pos.slug} | pairs=${pairs} | sum=${pairSum.toFixed(2)}c | forced=${
-    pos.forced ? "yes" : "no"
-  } | pnl=$${pnl.toFixed(3)} | realized=$${realizedUsd.toFixed(2)} | cash=$${cashUsd.toFixed(
-    2
-  )} | trades=${totalTrades} | wait=${elapsedSec}s`;
-  logInfo(closeMsg);
-  await notifyTelegram(closeMsg);
-}
-
-async function managePosition(pr: PriceRow, now: number): Promise<void> {
-  const pos = position;
-  if (!pos) return;
-  if (pos.slug !== pr.slug) {
-    const secondNow = pos.firstSide === "UP" ? pr.downCents : pr.upCents;
-    while (pos.secondLegPrices.length < pos.firstLegPrices.length) {
-      await buyLeg(pos.firstSide === "UP" ? "DOWN" : "UP", secondNow, pos.slug);
-      pos.secondLegPrices.push(secondNow);
-      pos.forced = true;
-    }
-    await settlePosition(pos, now);
-    position = null;
-    return;
-  }
-
-  const firstNow = pos.firstSide === "UP" ? pr.upCents : pr.downCents;
-  const secondNow = pos.firstSide === "UP" ? pr.downCents : pr.upCents;
-
-  if (
-    pos.firstLegPrices.length < maxLegsPerSide &&
-    firstNow <= firstLegMaxCents &&
-    firstNow <= pos.lastFirstFillCents - addStepCents
-  ) {
-    await buyLeg(pos.firstSide, firstNow, pr.slug);
-    pos.firstLegPrices.push(firstNow);
-    pos.lastFirstFillCents = firstNow;
-  }
-
-  while (pos.secondLegPrices.length < pos.firstLegPrices.length) {
-    const nextAvgFirst = mean(pos.firstLegPrices);
-    const nextAvgSecond = mean([...pos.secondLegPrices, secondNow]);
-    if (nextAvgFirst + nextAvgSecond <= maxPairSumCents) {
-      await buyLeg(pos.firstSide === "UP" ? "DOWN" : "UP", secondNow, pr.slug);
-      pos.secondLegPrices.push(secondNow);
-    } else {
-      break;
-    }
-  }
-
-  const timeoutMs = secondLegTimeoutSec * 1000;
-  if (forceSecondLeg && now - pos.openedAtMs >= timeoutMs && pos.secondLegPrices.length < pos.firstLegPrices.length) {
-    while (pos.secondLegPrices.length < pos.firstLegPrices.length) {
-      await buyLeg(pos.firstSide === "UP" ? "DOWN" : "UP", secondNow, pr.slug);
-      pos.secondLegPrices.push(secondNow);
-      pos.forced = true;
-    }
-  }
-
-  if (pos.secondLegPrices.length >= pos.firstLegPrices.length && pos.firstLegPrices.length > 0) {
-    await settlePosition(pos, now);
-    position = null;
-  }
+  totalWindows += 1;
+  const msg =
+    `WINDOW END ${s.slug} | paired=${s.pairedShares.toFixed(1)} sumAvg=${s.sumAvgCents.toFixed(1)}c | ` +
+    `buy=$${s.buyUsd.toFixed(2)} return=$${returnUsd.toFixed(2)} pnl=$${pnl.toFixed(2)} | ` +
+    `cash=$${cashUsd.toFixed(2)} realized=$${realizedUsd.toFixed(2)} windows=${totalWindows}`;
+  logInfo(msg);
+  await notifyTelegram(msg);
 }
 
 async function tick(): Promise<void> {
   const now = Date.now();
   const slug = slugForCurrent15m(market);
-  const pr = await getLivePrices(slug);
-  await managePosition(pr, now);
-  await tryOpenPosition(pr, now);
-  const openInfo = position
-    ? `open=${position.firstSide} legs ${position.firstLegPrices.length}/${position.secondLegPrices.length} slug=${position.slug}`
-    : "open=none";
-  const equity = cashUsd;
+  const q = await fetchMarketQuote(slug);
+
+  if (position && position.slug !== q.slug) {
+    await closeWindow(position, q.upMidCents, q.downMidCents);
+    position = null;
+  }
+
+  if (!isQuoteTradable(q)) {
+    logInfo(`${q.slug} skip bad quote up=${q.upAskCents}c down=${q.downAskCents}c`);
+    return;
+  }
+
+  const intent = decideBuy(cele, q, position, now);
+  if (intent) {
+    if (!position) {
+      position = {
+        slug: q.slug,
+        openedAtMs: now,
+        upQty: 0,
+        downQty: 0,
+        upCostUsd: 0,
+        downCostUsd: 0,
+        upBuys: 0,
+        downBuys: 0,
+        lastBuyMs: 0,
+        lastUpCents: null,
+        lastDownCents: null,
+      };
+    }
+    await buySide(intent.side, intent.cents, q.slug, intent.reason);
+    applyBuy(position, intent.side, intent.cents, cele.sharesPerOrder, now);
+  }
+
+  const posLine = position ? formatPositionLine(position) : "flat";
   logInfo(
-    `${new Date(now).toISOString()} ${pr.slug} up=${pr.upCents}c down=${pr.downCents} cash=$${cashUsd.toFixed(
-      2
-    )} eq=$${equity.toFixed(2)} pnl=$${(equity - initialUsd).toFixed(2)} ${openInfo}`
+    `${q.slug} ask up=${q.upAskCents}c down=${q.downAskCents}c | eq=$${cashUsd.toFixed(2)} pnl=$${(cashUsd - initialUsd).toFixed(2)} | ${posLine}`,
   );
 }
 
 async function main(): Promise<void> {
   const dbUrlPresent = Boolean(process.env.DATABASE_URL?.trim());
-  if (!dbUrlPresent) {
-    logInfo("db=off reason=no DATABASE_URL (add Variable Reference Postgres → DATABASE_URL on this service)");
-  } else {
-    dbEnabled = await ensureDbReady().catch((e) => {
-      const m = e instanceof Error ? e.message : String(e);
-      logWarn(`db=off reason=ensureDbReady failed: ${m}`);
-      return false;
-    });
+  if (dbUrlPresent) {
+    dbEnabled = await ensureDbReady().catch(() => false);
   }
-  logInfo(
-    `Paper bot started. market=${market} poll=${pollMs}ms sum<=${maxPairSumCents} first<=${firstLegMaxCents} timeout=${secondLegTimeoutSec}s legs<=${maxLegsPerSide} step=${addStepCents}c shares=${sharesPerLeg} start=$${initialUsd.toFixed(
-      2
-    )} telegram=${telegramToken && telegramChatId ? "on" : "off"} db=${dbEnabled ? "on" : "off"} logFile=${paperLogFile}`
-  );
-  await notifyTelegram(
-    `Paper bot started: ${market.toUpperCase()} | sum<=${maxPairSumCents} first<=${firstLegMaxCents} timeout=${secondLegTimeoutSec}s legs<=${maxLegsPerSide} step=${addStepCents}c`
-  );
+
+  const startMsg =
+    `Cele-style paper | ${market.toUpperCase()} poll=${pollMs}ms shares=${cele.sharesPerOrder} ` +
+    `maxLegs/side=${cele.maxBuysPerSide} maxSumAvg=${cele.maxSumAvg} capImbal=${cele.maxSideImbalanceShares} ` +
+    `start=$${initialUsd.toFixed(0)} db=${dbEnabled ? "on" : "off"}`;
+  logInfo(startMsg);
+  await notifyTelegram(startMsg);
+
   for (;;) {
     try {
       await tick();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logWarn(`tick error: ${msg}`);
+      logWarn(`tick error: ${e instanceof Error ? e.message : String(e)}`);
     }
     await new Promise((r) => setTimeout(r, pollMs));
   }
 }
 
 main().catch((e) => {
-  const msg = e instanceof Error ? e.message : String(e);
   console.error(e);
-  appendPaperLog("error", `fatal: ${msg}`);
   process.exit(1);
 });
-
