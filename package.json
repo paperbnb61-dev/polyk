@@ -9,13 +9,17 @@
     "collect:api": "tsx src/collector.ts",
     "collect:ui": "tsx src/ui-collector.ts",
     "paper": "tsx src/paper-bot.ts",
+    "live": "tsx src/live-bot.ts",
     "backtest:pairs": "tsx src/backtest-pairs.ts",
+    "db:stats": "tsx src/db-stats.ts",
     "build": "tsc"
   },
   "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.6",
     "dotenv": "^16.4.7",
     "luxon": "^3.5.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "viem": "^2.31.0"
   },
   "devDependencies": {
     "@types/luxon": "^3.4.2",
