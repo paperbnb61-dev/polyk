@@ -5,8 +5,8 @@ nixPkgs = ["nodejs_22"]
 cmds = ["npm ci --include=dev"]
 
 [phases.build]
-cmds = ["echo 'skip tsc build on railway collector deploy'"]
+cmds = ["echo 'skip tsc build on railway paper bot deploy'"]
 
 [start]
-cmd = "npm run collect:api"
+cmd = "npm run paper"
 
