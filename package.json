@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx src/collector.ts",
+    "start": "tsx src/paper-bot.ts",
     "collect": "tsx src/ui-collector.ts",
     "collect:api": "tsx src/collector.ts",
     "collect:ui": "tsx src/ui-collector.ts",
