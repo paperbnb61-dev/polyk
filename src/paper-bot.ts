@@ -10,7 +10,17 @@ import {
   type Side,
   type SlugPosition,
 } from "./cele-strategy.js";
-import { envNumber, envString } from "./env-util.js";
+import {
+  formatPnlReport,
+  loadDryPnl,
+  markReportSent,
+  recordBuy,
+  recordWindowEnd,
+  saveDryPnl,
+  shouldSendReport,
+  type DryPnlState,
+} from "./dry-pnl.js";
+import { envBool, envNumber, envString } from "./env-util.js";
 import { fetchMarketQuote, isQuoteTradable } from "./market-quotes.js";
 import { slugForCurrent15m } from "./slug.js";
 import { ensureDbReady, insertPaperEvent } from "./db.js";
@@ -25,6 +35,17 @@ const initialUsd = Math.max(1, envNumber("PAPER_INITIAL_USD", 10000));
 const telegramToken = envString("TELEGRAM_BOT_TOKEN", "");
 const telegramChatId = envString("TELEGRAM_CHAT_ID", "");
 const paperLogFile = envString("PAPER_LOG_FILE", "data/paper-logs.jsonl");
+const paperPnlSummaryFile = envString("PAPER_PNL_SUMMARY_FILE", "data/paper-pnl-summary.json");
+const pnlReportIntervalMs = Math.max(
+  60_000,
+  envNumber(
+    "PAPER_PNL_REPORT_INTERVAL_MS",
+    envNumber("PAPER_PNL_REPORT_INTERVAL_HOURS", 1) * 3_600_000,
+  ),
+);
+const pnlReportEnabled = envBool("PAPER_PNL_REPORT_ENABLED", true);
+const telegramOnBuy = envBool("PAPER_TELEGRAM_ON_BUY", false);
+const telegramOnWindowEnd = envBool("PAPER_TELEGRAM_ON_WINDOW_END", false);
 
 let cashUsd = initialUsd;
 let realizedUsd = 0;
@@ -32,6 +53,9 @@ let position: SlugPosition | null = null;
 let totalWindows = 0;
 let totalBuys = 0;
 let dbEnabled = false;
+let paperPnl: DryPnlState = loadDryPnl(paperPnlSummaryFile);
+let buyUsdToday = 0;
+let buyUsdDayKey = "";
 
 function detectEventType(message: string): string {
   if (message.startsWith("BUY ")) return "BUY";
@@ -99,17 +123,29 @@ async function notifyTelegram(text: string): Promise<void> {
   }
 }
 
+function trackBuySpend(usd: number): void {
+  const key = new Date().toISOString().slice(0, 10);
+  if (key !== buyUsdDayKey) {
+    buyUsdDayKey = key;
+    buyUsdToday = 0;
+  }
+  buyUsdToday += usd;
+}
+
 async function buySide(side: Side, cents: number, slug: string, reason: string): Promise<void> {
   const cost = (cents / 100) * cele.sharesPerOrder;
   const fee = cost * feeRate;
   cashUsd -= cost + fee;
   totalBuys += 1;
+  trackBuySpend(cost + fee);
+  recordBuy(paperPnl);
+  saveDryPnl(paperPnlSummaryFile, paperPnl);
   const label = side === "UP" ? "YES" : "NO";
   const msg =
     `BUY ${market.toUpperCase()} ${label} ${cele.sharesPerOrder}@${cents}c | ${reason} | #${totalBuys} | ` +
     `cash=$${cashUsd.toFixed(2)} realized=$${realizedUsd.toFixed(2)} | ${slug}`;
   logInfo(msg);
-  await notifyTelegram(msg);
+  if (telegramOnBuy) await notifyTelegram(msg);
 }
 
 async function closeWindow(pos: SlugPosition, upMark: number, downMark: number): Promise<void> {
@@ -125,49 +161,88 @@ async function closeWindow(pos: SlugPosition, upMark: number, downMark: number):
     `buy=$${s.buyUsd.toFixed(2)} return=$${returnUsd.toFixed(2)} pnl=$${pnl.toFixed(2)} | ` +
     `cash=$${cashUsd.toFixed(2)} realized=$${realizedUsd.toFixed(2)} windows=${totalWindows}`;
   logInfo(msg);
-  await notifyTelegram(msg);
+  recordWindowEnd(paperPnl, {
+    slug: s.slug,
+    buyUsd: s.buyUsd,
+    estReturn: returnUsd,
+    estPnl: pnl,
+  });
+  saveDryPnl(paperPnlSummaryFile, paperPnl);
+  if (telegramOnWindowEnd) await notifyTelegram(msg);
+}
+
+async function maybeSendPnlReport(nowMs: number): Promise<void> {
+  if (!pnlReportEnabled) return;
+  if (!shouldSendReport(paperPnl, pnlReportIntervalMs, nowMs)) return;
+
+  const hours = pnlReportIntervalMs / 3_600_000;
+  const openLine = position ? formatPositionLine(position) : "flat";
+  const equity = cashUsd;
+  const sessionPnl = equity - initialUsd;
+  const text = [
+    formatPnlReport({
+      modeLabel: "PAPER",
+      market,
+      intervalHours: hours,
+      state: paperPnl,
+      buyUsdToday,
+      openPositionLine: openLine,
+    }),
+    "",
+    `Cash: $${cashUsd.toFixed(2)} | equity≈$${equity.toFixed(2)} | session PnL: ${sessionPnl >= 0 ? "+" : ""}$${sessionPnl.toFixed(2)}`,
+    `Realized (closed windows): $${realizedUsd.toFixed(2)}`,
+  ].join("\n");
+
+  markReportSent(paperPnl);
+  saveDryPnl(paperPnlSummaryFile, paperPnl);
+  logInfo(`PNL REPORT\n${text}`);
+  await notifyTelegram(text);
 }
 
 async function tick(): Promise<void> {
   const now = Date.now();
-  const slug = slugForCurrent15m(market);
-  const q = await fetchMarketQuote(slug);
+  try {
+    const slug = slugForCurrent15m(market);
+    const q = await fetchMarketQuote(slug);
 
-  if (position && position.slug !== q.slug) {
-    await closeWindow(position, q.upMidCents, q.downMidCents);
-    position = null;
-  }
-
-  if (!isQuoteTradable(q)) {
-    logInfo(`${q.slug} skip bad quote up=${q.upAskCents}c down=${q.downAskCents}c`);
-    return;
-  }
-
-  const intent = decideBuy(cele, q, position, now);
-  if (intent) {
-    if (!position) {
-      position = {
-        slug: q.slug,
-        openedAtMs: now,
-        upQty: 0,
-        downQty: 0,
-        upCostUsd: 0,
-        downCostUsd: 0,
-        upBuys: 0,
-        downBuys: 0,
-        lastBuyMs: 0,
-        lastUpCents: null,
-        lastDownCents: null,
-      };
+    if (position && position.slug !== q.slug) {
+      await closeWindow(position, q.upMidCents, q.downMidCents);
+      position = null;
     }
-    await buySide(intent.side, intent.cents, q.slug, intent.reason);
-    applyBuy(position, intent.side, intent.cents, cele.sharesPerOrder, now);
-  }
 
-  const posLine = position ? formatPositionLine(position) : "flat";
-  logInfo(
-    `${q.slug} ask up=${q.upAskCents}c down=${q.downAskCents}c | eq=$${cashUsd.toFixed(2)} pnl=$${(cashUsd - initialUsd).toFixed(2)} | ${posLine}`,
-  );
+    if (!isQuoteTradable(q)) {
+      logInfo(`${q.slug} skip bad quote up=${q.upAskCents}c down=${q.downAskCents}c`);
+      return;
+    }
+
+    const intent = decideBuy(cele, q, position, now);
+    if (intent) {
+      if (!position) {
+        position = {
+          slug: q.slug,
+          openedAtMs: now,
+          upQty: 0,
+          downQty: 0,
+          upCostUsd: 0,
+          downCostUsd: 0,
+          upBuys: 0,
+          downBuys: 0,
+          lastBuyMs: 0,
+          lastUpCents: null,
+          lastDownCents: null,
+        };
+      }
+      await buySide(intent.side, intent.cents, q.slug, intent.reason);
+      applyBuy(position, intent.side, intent.cents, cele.sharesPerOrder, now);
+    }
+
+    const posLine = position ? formatPositionLine(position) : "flat";
+    logInfo(
+      `${q.slug} ask up=${q.upAskCents}c down=${q.downAskCents}c | eq=$${cashUsd.toFixed(2)} pnl=$${(cashUsd - initialUsd).toFixed(2)} | ${posLine}`,
+    );
+  } finally {
+    await maybeSendPnlReport(now);
+  }
 }
 
 async function main(): Promise<void> {
@@ -181,7 +256,13 @@ async function main(): Promise<void> {
     `maxLegs/side=${cele.maxBuysPerSide} maxSumAvg=${cele.maxSumAvg} capImbal=${cele.maxSideImbalanceShares} ` +
     `start=$${initialUsd.toFixed(0)} db=${dbEnabled ? "on" : "off"}`;
   logInfo(startMsg);
-  await notifyTelegram(startMsg);
+  paperPnl = loadDryPnl(paperPnlSummaryFile);
+  const reportH = (pnlReportIntervalMs / 3_600_000).toFixed(1);
+  if (pnlReportEnabled && telegramToken && telegramChatId) {
+    await notifyTelegram(
+      `${startMsg}\nTelegram: сводка каждые ${reportH}ч (BUY/window алерты выкл).`,
+    );
+  }
 
   for (;;) {
     try {

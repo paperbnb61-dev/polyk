@@ -12,6 +12,7 @@
     "live": "tsx src/live-bot.ts",
     "backtest:pairs": "tsx src/backtest-pairs.ts",
     "db:stats": "tsx src/db-stats.ts",
+    "dry:stats": "node scripts/dry-pnl-stats.mjs",
     "build": "tsc"
   },
   "dependencies": {
