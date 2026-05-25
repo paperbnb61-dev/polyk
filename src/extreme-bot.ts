@@ -5,7 +5,7 @@
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import { envNumber, envString } from "./env-util.js";
+import { envBool, envNumber, envString } from "./env-util.js";
 import {
   applyEnter,
   decideExtreme,
@@ -26,11 +26,21 @@ const logFile = envString("EXTREME_LOG_FILE", "data/extreme-paper-logs.jsonl");
 const logToFile = envString("EXTREME_LOG_TO_FILE", process.env.RAILWAY_ENVIRONMENT ? "false" : "true").toLowerCase() !== "false";
 const cfg = loadExtremeConfig();
 
+const telegramToken = envString("TELEGRAM_BOT_TOKEN", "");
+const telegramChatId = envString("TELEGRAM_CHAT_ID", "");
+const pnlReportEnabled = envBool("EXTREME_PNL_REPORT_ENABLED", true);
+const pnlReportIntervalMs = envNumber(
+  "EXTREME_PNL_REPORT_INTERVAL_MS",
+  envNumber("EXTREME_PNL_REPORT_INTERVAL_HOURS", 4) * 3_600_000,
+);
+
 let cashUsd = initialUsd;
 let realizedUsd = 0;
 let trades = 0;
 let wins = 0;
 let runtime: SlugRuntime | null = null;
+let lastReportMs = Date.now();
+let reportSnap = { trades: 0, wins: 0, realizedUsd: 0 };
 
 function appendLog(
   event: string,
@@ -58,6 +68,51 @@ function appendLog(
   if (opts.console !== false && event !== "TICK") {
     console.log(`[extreme] ${message}`);
   }
+}
+
+async function notifyTelegram(text: string): Promise<void> {
+  if (!telegramToken || !telegramChatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: telegramChatId, text, disable_web_page_preview: true }),
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function maybeSendPnlReport(nowMs: number, posLine: string): Promise<void> {
+  if (!pnlReportEnabled || !telegramToken || !telegramChatId) return;
+  if (nowMs - lastReportMs < pnlReportIntervalMs) return;
+
+  const hours = pnlReportIntervalMs / 3_600_000;
+  const periodTrades = trades - reportSnap.trades;
+  const periodRealized = realizedUsd - reportSnap.realizedUsd;
+  const winPct = trades > 0 ? ((wins / trades) * 100).toFixed(1) : "—";
+  const sessionPnl = cashUsd - initialUsd;
+  const sign = (n: number) => (n >= 0 ? "+" : "");
+
+  const text = [
+    `📊 Extreme PnL (${hours}ч)`,
+    `EXTREME | ${market.toUpperCase()}`,
+    "",
+    `За ${hours}ч:`,
+    `  сделок: ${periodTrades} | realized: ${sign(periodRealized)}$${periodRealized.toFixed(2)}`,
+    "",
+    `Всего с запуска:`,
+    `  сделок: ${trades} | win: ${winPct}%`,
+    `  realized: ${sign(realizedUsd)}$${realizedUsd.toFixed(2)}`,
+    `  cash: $${cashUsd.toFixed(2)} | session: ${sign(sessionPnl)}$${sessionPnl.toFixed(2)}`,
+    "",
+    `Позиция: ${posLine}`,
+  ].join("\n");
+
+  lastReportMs = nowMs;
+  reportSnap = { trades, wins, realizedUsd };
+  appendLog("PNL_REPORT", text.replace(/\n/g, " | "));
+  await notifyTelegram(text);
 }
 
 async function tick(): Promise<void> {
@@ -152,13 +207,18 @@ async function tick(): Promise<void> {
     { slug, yesC: q.upAskCents, downC: q.downAskCents },
     { console: false },
   );
+
+  await maybeSendPnlReport(now, posLine);
 }
 
 async function main(): Promise<void> {
-  appendLog(
-    "START",
-    `Extreme paper | ${market.toUpperCase()} poll=${pollMs}ms | YES ${cfg.yesTriggerCents}c→${cfg.yesExitCents}c (${cfg.yesConfirmTicks} ticks) | NO YES<=${cfg.noYesTriggerCents}c (${cfg.noConfirmTicks} ticks) | size=${cfg.positionPct * 100}% fee=${cfg.feeRate} | $${initialUsd}`,
-  );
+  const reportH = (pnlReportIntervalMs / 3_600_000).toFixed(1);
+  const startMsg =
+    `Extreme paper | ${market.toUpperCase()} poll=${pollMs}ms | YES ${cfg.yesTriggerCents}c→${cfg.yesExitCents}c (${cfg.yesConfirmTicks} ticks) | NO YES<=${cfg.noYesTriggerCents}c (${cfg.noConfirmTicks} ticks) | size=${cfg.positionPct * 100}% fee=${cfg.feeRate} | $${initialUsd}`;
+  appendLog("START", startMsg);
+  if (pnlReportEnabled && telegramToken && telegramChatId) {
+    await notifyTelegram(`${startMsg}\nTelegram: сводка каждые ${reportH}ч.`);
+  }
 
   for (;;) {
     try {
