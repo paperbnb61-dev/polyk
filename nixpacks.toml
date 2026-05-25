@@ -8,5 +8,5 @@ cmds = ["npm ci --include=dev"]
 cmds = ["echo 'skip tsc build on railway paper bot deploy'"]
 
 [start]
-cmd = "npm run paper"
+cmd = "npm run extreme"
 
