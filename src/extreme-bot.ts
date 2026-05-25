@@ -23,6 +23,7 @@ const market = envString("EXTREME_MARKET", "btc");
 const pollMs = Math.max(200, envNumber("EXTREME_POLL_MS", 300));
 const initialUsd = Math.max(10, envNumber("EXTREME_INITIAL_USD", 1000));
 const logFile = envString("EXTREME_LOG_FILE", "data/extreme-paper-logs.jsonl");
+const logToFile = envString("EXTREME_LOG_TO_FILE", process.env.RAILWAY_ENVIRONMENT ? "false" : "true").toLowerCase() !== "false";
 const cfg = loadExtremeConfig();
 
 let cashUsd = initialUsd;
@@ -50,8 +51,10 @@ function appendLog(
     ...extra,
   };
   const out = path.resolve(process.cwd(), logFile);
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.appendFileSync(out, JSON.stringify(row) + "\n", "utf8");
+  if (logToFile) {
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.appendFileSync(out, JSON.stringify(row) + "\n", "utf8");
+  }
   if (opts.console !== false && event !== "TICK") {
     console.log(`[extreme] ${message}`);
   }
