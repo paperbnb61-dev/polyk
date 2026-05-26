@@ -1,6 +1,5 @@
 /**
- * Extreme-edge paper bot (YES@88c / NO@20c strategy).
- * No Postgres — logs to JSONL only.
+ * extreme-bot.ts — paper bot, стратегия YES@88c / NO@20c
  */
 import dotenv from "dotenv";
 import fs from "fs";
@@ -11,8 +10,8 @@ import {
   decideExtreme,
   loadExtremeConfig,
   newSlugRuntime,
-  type SlugRuntime,
   windowRemainingSec,
+  type SlugRuntime,
 } from "./extreme-strategy.js";
 import { fetchMarketQuote, isQuoteTradable } from "./market-quotes.js";
 import { slugForCurrent15m } from "./slug.js";
@@ -23,24 +22,31 @@ const market = envString("EXTREME_MARKET", "btc");
 const pollMs = Math.max(200, envNumber("EXTREME_POLL_MS", 300));
 const initialUsd = Math.max(10, envNumber("EXTREME_INITIAL_USD", 1000));
 const logFile = envString("EXTREME_LOG_FILE", "data/extreme-paper-logs.jsonl");
-const logToFile = envString("EXTREME_LOG_TO_FILE", process.env.RAILWAY_ENVIRONMENT ? "false" : "true").toLowerCase() !== "false";
-const cfg = loadExtremeConfig();
+const logToFile =
+  envString("EXTREME_LOG_TO_FILE", process.env.RAILWAY_ENVIRONMENT ? "false" : "true").toLowerCase() !== "false";
 
 const telegramToken = envString("TELEGRAM_BOT_TOKEN", "");
 const telegramChatId = envString("TELEGRAM_CHAT_ID", "");
-const pnlReportEnabled = envBool("EXTREME_PNL_REPORT_ENABLED", true);
-const pnlReportIntervalMs = envNumber(
+const pnlEnabled = envBool("EXTREME_PNL_REPORT_ENABLED", true);
+const pnlIntervalMs = envNumber(
   "EXTREME_PNL_REPORT_INTERVAL_MS",
   envNumber("EXTREME_PNL_REPORT_INTERVAL_HOURS", 4) * 3_600_000,
 );
+
+const cfg = loadExtremeConfig();
 
 let cashUsd = initialUsd;
 let realizedUsd = 0;
 let trades = 0;
 let wins = 0;
+let losses = 0;
 let runtime: SlugRuntime | null = null;
+
+let lastYesC = 50;
+let lastNoC = 50;
+
 let lastReportMs = Date.now();
-let reportSnap = { trades: 0, wins: 0, realizedUsd: 0 };
+let reportSnap = { trades: 0, wins: 0, losses: 0, realizedUsd: 0 };
 
 function appendLog(
   event: string,
@@ -58,6 +64,7 @@ function appendLog(
     realizedUsd,
     trades,
     wins,
+    losses,
     ...extra,
   };
   const out = path.resolve(process.cwd(), logFile);
@@ -70,13 +77,17 @@ function appendLog(
   }
 }
 
-async function notifyTelegram(text: string): Promise<void> {
+async function notify(text: string): Promise<void> {
   if (!telegramToken || !telegramChatId) return;
   try {
     await fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: telegramChatId, text, disable_web_page_preview: true }),
+      body: JSON.stringify({
+        chat_id: telegramChatId,
+        text,
+        disable_web_page_preview: true,
+      }),
     });
   } catch {
     /* ignore */
@@ -84,12 +95,12 @@ async function notifyTelegram(text: string): Promise<void> {
 }
 
 async function maybeSendPnlReport(nowMs: number, posLine: string): Promise<void> {
-  if (!pnlReportEnabled || !telegramToken || !telegramChatId) return;
-  if (nowMs - lastReportMs < pnlReportIntervalMs) return;
+  if (!pnlEnabled || !telegramToken || !telegramChatId) return;
+  if (nowMs - lastReportMs < pnlIntervalMs) return;
 
-  const hours = pnlReportIntervalMs / 3_600_000;
+  const hours = (pnlIntervalMs / 3_600_000).toFixed(1);
   const periodTrades = trades - reportSnap.trades;
-  const periodRealized = realizedUsd - reportSnap.realizedUsd;
+  const periodPnl = realizedUsd - reportSnap.realizedUsd;
   const winPct = trades > 0 ? ((wins / trades) * 100).toFixed(1) : "—";
   const sessionPnl = cashUsd - initialUsd;
   const sign = (n: number) => (n >= 0 ? "+" : "");
@@ -99,10 +110,10 @@ async function maybeSendPnlReport(nowMs: number, posLine: string): Promise<void>
     `EXTREME | ${market.toUpperCase()}`,
     "",
     `За ${hours}ч:`,
-    `  сделок: ${periodTrades} | realized: ${sign(periodRealized)}$${periodRealized.toFixed(2)}`,
+    `  сделок: ${periodTrades} | pnl: ${sign(periodPnl)}$${periodPnl.toFixed(2)}`,
     "",
     `Всего с запуска:`,
-    `  сделок: ${trades} | win: ${winPct}%`,
+    `  сделок: ${trades} | ✅${wins} ❌${losses} | win: ${winPct}%`,
     `  realized: ${sign(realizedUsd)}$${realizedUsd.toFixed(2)}`,
     `  cash: $${cashUsd.toFixed(2)} | session: ${sign(sessionPnl)}$${sessionPnl.toFixed(2)}`,
     "",
@@ -110,9 +121,33 @@ async function maybeSendPnlReport(nowMs: number, posLine: string): Promise<void>
   ].join("\n");
 
   lastReportMs = nowMs;
-  reportSnap = { trades, wins, realizedUsd };
+  reportSnap = { trades, wins, losses, realizedUsd };
   appendLog("PNL_REPORT", text.replace(/\n/g, " | "));
-  await notifyTelegram(text);
+  await notify(text);
+}
+
+function settleOnWindowRoll(oldRuntime: SlugRuntime): void {
+  if (!oldRuntime.position) return;
+  const pos = oldRuntime.position;
+
+  const yesAtRoll = lastYesC || 50;
+  const noAtRoll = lastNoC || 50;
+
+  const win = pos.side === "YES" ? yesAtRoll >= 50 : noAtRoll >= 50;
+  const payout = win ? pos.shares : 0;
+  const pnl = payout - pos.costUsd - pos.feeUsd;
+
+  cashUsd += payout;
+  realizedUsd += pnl;
+  trades += 1;
+  if (pnl > 0) wins += 1;
+  else losses += 1;
+
+  appendLog(
+    "SETTLE_ROLL",
+    `settle ${oldRuntime.slug} ${pos.side} ${pos.shares}sh ${win ? "WIN" : "LOSS"} yesC=${yesAtRoll}c noC=${noAtRoll}c payout=$${payout.toFixed(2)} pnl=$${pnl.toFixed(2)}`,
+    { slug: oldRuntime.slug, side: pos.side, pnl, yesAtRoll, noAtRoll },
+  );
 }
 
 async function tick(): Promise<void> {
@@ -120,33 +155,22 @@ async function tick(): Promise<void> {
   const slug = slugForCurrent15m(market, new Date(now));
 
   if (runtime && runtime.slug !== slug) {
-    if (runtime.position) {
-      const oldQ = await fetchMarketQuote(runtime.slug).catch(() => null);
-      const pos = runtime.position;
-      const yesMid = oldQ?.upMidCents ?? 50;
-      const noMid = oldQ?.downMidCents ?? 50;
-      const win = pos.side === "YES" ? yesMid >= 50 : noMid >= 50;
-      const payout = win ? pos.shares : 0;
-      const pnl = payout - pos.costUsd - pos.feeUsd;
-      cashUsd += payout;
-      realizedUsd += pnl;
-      if (pnl > 0) wins += 1;
-      appendLog(
-        "SETTLE",
-        `roll ${runtime.slug} ${pos.side} ${pos.shares}sh ${win ? "win" : "loss"} payout=$${payout.toFixed(2)} pnl=$${pnl.toFixed(2)}`,
-        { slug: runtime.slug, side: pos.side, pnl },
-      );
-    }
+    settleOnWindowRoll(runtime);
     appendLog("WINDOW_ROLL", `new window ${slug} (prev ${runtime.slug})`, { slug });
-    runtime = newSlugRuntime(slug);
+    runtime = newSlugRuntime(slug, now);
+    lastYesC = 50;
+    lastNoC = 50;
   }
-  if (!runtime) runtime = newSlugRuntime(slug);
+  if (!runtime) runtime = newSlugRuntime(slug, now);
 
   const q = await fetchMarketQuote(slug);
   if (!isQuoteTradable(q)) {
-    appendLog("SKIP", `${slug} bad quote up=${q.upAskCents}c down=${q.downAskCents}c`, { slug });
+    appendLog("SKIP", `${slug} untradable up=${q.upAskCents}c down=${q.downAskCents}c`, { slug }, { console: false });
     return;
   }
+
+  lastYesC = q.upAskCents;
+  lastNoC = q.downAskCents;
 
   const { actions, rt } = decideExtreme(cfg, q, runtime, now, cashUsd);
   runtime = rt;
@@ -155,42 +179,53 @@ async function tick(): Promise<void> {
     if (a.type === "ENTER") {
       const cost = (a.cents / 100) * a.shares;
       const fee = cost * cfg.feeRate;
+
       if (cost + fee > cashUsd) {
-        appendLog("SKIP", `insufficient cash for ${a.side} ${a.shares}@${a.cents}c`, { slug });
+        appendLog("SKIP", `no cash: need $${(cost + fee).toFixed(2)} have $${cashUsd.toFixed(2)}`, { slug }, { console: true });
         continue;
       }
+
       cashUsd -= cost + fee;
-      trades += 1;
       runtime = applyEnter(runtime!, a.side, a.cents, a.shares, cost, fee, now);
-      appendLog("ENTER", `BUY ${a.side} ${a.shares}@${a.cents}c | ${a.reason} | cash=$${cashUsd.toFixed(2)}`, {
-        slug,
-        side: a.side,
-        cents: a.cents,
-        shares: a.shares,
-      });
+      appendLog(
+        "ENTER",
+        `BUY ${a.side} ${a.shares}sh@${a.cents}c | ${a.reason} | cost=$${cost.toFixed(2)} fee=$${fee.toFixed(2)} cash=$${cashUsd.toFixed(2)}`,
+        { slug, side: a.side, cents: a.cents, shares: a.shares, cost, fee },
+      );
     } else if (a.type === "EXIT") {
       const pos = runtime!.position!;
       const proceeds = (a.cents / 100) * pos.shares;
       const pnl = proceeds - pos.costUsd - pos.feeUsd;
+
       cashUsd += proceeds;
       realizedUsd += pnl;
+      trades += 1;
       if (pnl > 0) wins += 1;
+      else losses += 1;
+
       runtime = { ...runtime!, position: null };
       appendLog(
         "EXIT",
-        `SELL ${a.side} ${pos.shares}@${a.cents}c | ${a.reason} | pnl=$${pnl.toFixed(2)} realized=$${realizedUsd.toFixed(2)}`,
-        { slug, side: a.side, pnl },
+        `SELL ${a.side} ${pos.shares}sh@${a.cents}c | ${a.reason} | pnl=$${pnl.toFixed(2)} realized=$${realizedUsd.toFixed(2)} cash=$${cashUsd.toFixed(2)}`,
+        { slug, side: a.side, cents: a.cents, pnl },
+      );
+      await notify(
+        `${pnl >= 0 ? "✅" : "❌"} ${a.side} ${pnl >= 0 ? "WIN" : "LOSS"} pnl=$${pnl.toFixed(2)} | ${a.reason} | cash=$${cashUsd.toFixed(2)}`,
       );
     } else if (a.type === "SETTLE") {
       const pos = runtime!.position!;
       const pnl = a.payoutUsd - pos.costUsd - pos.feeUsd;
+
       cashUsd += a.payoutUsd;
       realizedUsd += pnl;
+      trades += 1;
       if (pnl > 0) wins += 1;
+      else losses += 1;
+
       runtime = { ...runtime!, position: null };
       appendLog(
         "SETTLE",
-        `${a.side} ${pos.shares}sh ${a.reason} payout=$${a.payoutUsd.toFixed(2)} pnl=$${pnl.toFixed(2)}`,
+        `${a.side} ${pos.shares}sh | ${a.reason} | payout=$${a.payoutUsd.toFixed(2)} pnl=$${pnl.toFixed(2)} cash=$${cashUsd.toFixed(2)}`,
         { slug, side: a.side, pnl },
       );
     }
@@ -199,12 +234,13 @@ async function tick(): Promise<void> {
   const pos = runtime.position;
   const remain = windowRemainingSec(slug, now, cfg.windowSec).toFixed(0);
   const posLine = pos
-    ? `${pos.side} ${pos.shares}sh@${pos.entryCents}c`
+    ? `${pos.side} ${pos.shares}sh@${pos.entryCents}c (entry $${pos.costUsd.toFixed(2)})`
     : `watch y=${runtime.yesConfirmTicks}/${cfg.yesConfirmTicks} n=${runtime.noConfirmTicks}/${cfg.noConfirmTicks}`;
+
   appendLog(
     "TICK",
-    `${slug} YES=${q.upAskCents}c NO=${q.downAskCents}c | ${remain}s left | eq=$${cashUsd.toFixed(2)} | ${posLine}`,
-    { slug, yesC: q.upAskCents, downC: q.downAskCents },
+    `${slug} YES=${q.upAskCents}c NO=${q.downAskCents}c | ${remain}s left | cash=$${cashUsd.toFixed(2)} | ${posLine}`,
+    { slug, yesC: q.upAskCents, noC: q.downAskCents },
     { console: false },
   );
 
@@ -212,19 +248,29 @@ async function tick(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const reportH = (pnlReportIntervalMs / 3_600_000).toFixed(1);
-  const startMsg =
-    `Extreme paper | ${market.toUpperCase()} poll=${pollMs}ms | YES ${cfg.yesTriggerCents}c→${cfg.yesExitCents}c (${cfg.yesConfirmTicks} ticks) | NO YES<=${cfg.noYesTriggerCents}c (${cfg.noConfirmTicks} ticks) | size=${cfg.positionPct * 100}% fee=${cfg.feeRate} | $${initialUsd}`;
-  appendLog("START", startMsg);
-  if (pnlReportEnabled && telegramToken && telegramChatId) {
-    await notifyTelegram(`${startMsg}\nTelegram: сводка каждые ${reportH}ч.`);
+  const startMsg = [
+    `🚀 Extreme bot START | ${market.toUpperCase()}`,
+    `poll=${pollMs}ms | $${initialUsd}`,
+    `YES: >=${cfg.yesTriggerCents}c → ${cfg.yesConfirmTicks}ticks → exit@${cfg.yesExitCents}c | stop@${cfg.yesStopCents}c`,
+    `NO:  YES<=${cfg.noYesTriggerCents}c → ${cfg.noConfirmTicks}ticks → exit@${cfg.noExitCents}c | stop YES>=${cfg.noStopYesCents}c`,
+    `size=${cfg.positionPct * 100}% | fee=${cfg.feeRate * 100}% | blackout=${cfg.entryBlackoutSec}s | minRemain=${cfg.minRemainingSec}s`,
+    `blockYesUTC: [${[...cfg.blockYesHoursUtc].join(",")}]`,
+  ].join("\n");
+
+  appendLog("START", startMsg.replace(/\n/g, " | "));
+  console.log(startMsg);
+
+  if (pnlEnabled && telegramToken && telegramChatId) {
+    await notify(startMsg);
   }
 
   for (;;) {
     try {
       await tick();
     } catch (e) {
-      appendLog("ERROR", e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      appendLog("ERROR", msg);
+      console.error(`[extreme] ERROR: ${msg}`);
     }
     await new Promise((r) => setTimeout(r, pollMs));
   }
